@@ -96,6 +96,7 @@ def Test_call_default_args()
   assert_fails('call MyDefaultArgs("one", "two")', 'E118:')
 
   call CheckScriptFailure(['def Func(arg: number = asdf)', 'enddef'], 'E1001:')
+  call CheckScriptFailure(['def Func(arg: number = "text")', 'enddef'], 'E1013: argument 1: type mismatch, expected number but got string')
 enddef
 
 func Test_call_default_args_from_func()
@@ -128,6 +129,61 @@ def Test_call_def_varargs()
   assert_equal('one,foo', MyDefVarargs('one'))
   assert_equal('one,two', MyDefVarargs('one', 'two'))
   assert_equal('one,two,three', MyDefVarargs('one', 'two', 'three'))
+  call CheckDefFailure(['MyDefVarargs("one", 22)'], 'E1013: argument 2: type mismatch, expected string but got number')
+enddef
+
+let s:value = ''
+
+def FuncOneDefArg(opt = 'text')
+  s:value = opt
+enddef
+
+def FuncTwoDefArg(nr = 123, opt = 'text'): string
+  return nr .. opt
+enddef
+
+def FuncVarargs(...arg: list<string>): string
+  return join(arg, ',')
+enddef
+
+def Test_func_type_varargs()
+  let RefDefArg: func(?string)
+  RefDefArg = FuncOneDefArg
+  RefDefArg()
+  assert_equal('text', s:value)
+  RefDefArg('some')
+  assert_equal('some', s:value)
+
+  let RefDef2Arg: func(?number, ?string): string
+  RefDef2Arg = FuncTwoDefArg
+  assert_equal('123text', RefDef2Arg())
+  assert_equal('99text', RefDef2Arg(99))
+  assert_equal('77some', RefDef2Arg(77, 'some'))
+
+  call CheckDefFailure(['let RefWrong: func(string?)'], 'E1010:')
+  call CheckDefFailure(['let RefWrong: func(?string, string)'], 'E1007:')
+
+  let RefVarargs: func(...list<string>): string
+  RefVarargs = FuncVarargs
+  assert_equal('', RefVarargs())
+  assert_equal('one', RefVarargs('one'))
+  assert_equal('one,two', RefVarargs('one', 'two'))
+
+  call CheckDefFailure(['let RefWrong: func(...list<string>, string)'], 'E110:')
+  call CheckDefFailure(['let RefWrong: func(...list<string>, ?string)'], 'E110:')
+enddef
+
+" Only varargs
+def MyVarargsOnly(...args: list<string>): string
+  return join(args, ',')
+enddef
+
+def Test_call_varargs_only()
+  assert_equal('', MyVarargsOnly())
+  assert_equal('one', MyVarargsOnly('one'))
+  assert_equal('one,two', MyVarargsOnly('one', 'two'))
+  call CheckDefFailure(['MyVarargsOnly(1)'], 'E1013: argument 1: type mismatch, expected string but got number')
+  call CheckDefFailure(['MyVarargsOnly("one", 2)'], 'E1013: argument 2: type mismatch, expected string but got number')
 enddef
 
 def Test_using_var_as_arg()
@@ -139,6 +195,26 @@ enddef
 def Test_call_func_defined_later()
   call assert_equal('one', DefinedLater('one'))
   call assert_fails('call NotDefined("one")', 'E117:')
+enddef
+
+def CombineFuncrefTypes()
+  " same arguments, different return type
+  let Ref1: func(bool): string
+  let Ref2: func(bool): number
+  let Ref3: func(bool): any
+  Ref3 = g:cond ? Ref1 : Ref2
+
+  " different number of arguments
+  let Refa1: func(bool): number
+  let Refa2: func(bool, number): number
+  let Refa3: func: number
+  Refa3 = g:cond ? Refa1 : Refa2
+
+  " different argument types
+  let Refb1: func(bool, string): number
+  let Refb2: func(string, number): number
+  let Refb3: func(any, any): number
+  Refb3 = g:cond ? Refb1 : Refb2
 enddef
 
 func DefinedLater(arg)
@@ -174,6 +250,7 @@ enddef
 def Test_arg_type_wrong()
   CheckScriptFailure(['def Func3(items: list)', 'echo "a"', 'enddef'], 'E1008: Missing <type>')
   CheckScriptFailure(['def Func4(...)', 'echo "a"', 'enddef'], 'E1055: Missing name after ...')
+  CheckScriptFailure(['def Func5(items)', 'echo "a"'], 'E1077:')
 enddef
 
 def Test_vim9script_call()
@@ -373,12 +450,25 @@ def FuncNoArgRetNumber(): number
   return 1234
 enddef
 
+def FuncNoArgRetString(): string
+  funcResult = 45
+  return 'text'
+enddef
+
 def FuncOneArgNoRet(arg: number)
   funcResult = arg
 enddef
 
 def FuncOneArgRetNumber(arg: number): number
   funcResult = arg
+  return arg
+enddef
+
+def FuncTwoArgNoRet(one: bool, two: number)
+  funcResult = two
+enddef
+
+def FuncOneArgRetString(arg: string): string
   return arg
 enddef
 
@@ -415,12 +505,46 @@ def Test_func_type()
   assert_equal(13, funcResult)
 enddef
 
+def Test_func_type_part()
+  let RefVoid: func: void
+  RefVoid = FuncNoArgNoRet
+  RefVoid = FuncOneArgNoRet
+  CheckDefFailure(['let RefVoid: func: void', 'RefVoid = FuncNoArgRetNumber'], 'E1013: type mismatch, expected func() but got func(): number')
+  CheckDefFailure(['let RefVoid: func: void', 'RefVoid = FuncNoArgRetString'], 'E1013: type mismatch, expected func() but got func(): string')
+
+  let RefAny: func(): any
+  RefAny = FuncNoArgRetNumber
+  RefAny = FuncNoArgRetString
+  CheckDefFailure(['let RefAny: func(): any', 'RefAny = FuncNoArgNoRet'], 'E1013: type mismatch, expected func(): any but got func()')
+  CheckDefFailure(['let RefAny: func(): any', 'RefAny = FuncOneArgNoRet'], 'E1013: type mismatch, expected func(): any but got func(number)')
+
+  let RefNr: func: number
+  RefNr = FuncNoArgRetNumber
+  RefNr = FuncOneArgRetNumber
+  CheckDefFailure(['let RefNr: func: number', 'RefNr = FuncNoArgNoRet'], 'E1013: type mismatch, expected func(): number but got func()')
+  CheckDefFailure(['let RefNr: func: number', 'RefNr = FuncNoArgRetString'], 'E1013: type mismatch, expected func(): number but got func(): string')
+
+  let RefStr: func: string
+  RefStr = FuncNoArgRetString
+  RefStr = FuncOneArgRetString
+  CheckDefFailure(['let RefStr: func: string', 'RefStr = FuncNoArgNoRet'], 'E1013: type mismatch, expected func(): string but got func()')
+  CheckDefFailure(['let RefStr: func: string', 'RefStr = FuncNoArgRetNumber'], 'E1013: type mismatch, expected func(): string but got func(): number')
+enddef
+
 def Test_func_type_fails()
   CheckDefFailure(['let ref1: func()'], 'E704:')
 
   CheckDefFailure(['let Ref1: func()', 'Ref1 = FuncNoArgRetNumber'], 'E1013: type mismatch, expected func() but got func(): number')
   CheckDefFailure(['let Ref1: func()', 'Ref1 = FuncOneArgNoRet'], 'E1013: type mismatch, expected func() but got func(number)')
   CheckDefFailure(['let Ref1: func()', 'Ref1 = FuncOneArgRetNumber'], 'E1013: type mismatch, expected func() but got func(number): number')
+  CheckDefFailure(['let Ref1: func(bool)', 'Ref1 = FuncTwoArgNoRet'], 'E1013: type mismatch, expected func(bool) but got func(bool, number)')
+  CheckDefFailure(['let Ref1: func(?bool)', 'Ref1 = FuncTwoArgNoRet'], 'E1013: type mismatch, expected func(?bool) but got func(bool, number)')
+  CheckDefFailure(['let Ref1: func(...bool)', 'Ref1 = FuncTwoArgNoRet'], 'E1013: type mismatch, expected func(...bool) but got func(bool, number)')
+
+  call CheckDefFailure(['let RefWrong: func(string ,number)'], 'E1068:')
+  call CheckDefFailure(['let RefWrong: func(string,number)'], 'E1069:')
+  call CheckDefFailure(['let RefWrong: func(bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool)'], 'E740:')
+  call CheckDefFailure(['let RefWrong: func(bool):string'], 'E1069:')
 enddef
 
 def Test_func_return_type()
@@ -437,6 +561,37 @@ def Test_func_return_type()
 
   CheckDefFailure(['let str: string', 'str = FuncNoArgRetNumber()'], 'E1013: type mismatch, expected string but got number')
 enddef
+
+def MultiLine(
+    arg1: string,
+    arg2 = 1234,
+    ...rest: list<string>
+      ): string
+  return arg1 .. arg2 .. join(rest, '-')
+enddef
+
+def MultiLineComment(
+    arg1: string, # comment
+    arg2 = 1234, # comment
+    ...rest: list<string> # comment
+      ): string # comment
+  return arg1 .. arg2 .. join(rest, '-')
+enddef
+
+def Test_multiline()
+  assert_equal('text1234', MultiLine('text'))
+  assert_equal('text777', MultiLine('text', 777))
+  assert_equal('text777one', MultiLine('text', 777, 'one'))
+  assert_equal('text777one-two', MultiLine('text', 777, 'one', 'two'))
+enddef
+
+func Test_multiline_not_vim9()
+  call assert_equal('text1234', MultiLine('text'))
+  call assert_equal('text777', MultiLine('text', 777))
+  call assert_equal('text777one', MultiLine('text', 777, 'one'))
+  call assert_equal('text777one-two', MultiLine('text', 777, 'one', 'two'))
+endfunc
+
 
 " When using CheckScriptFailure() for the below test, E1010 is generated instead
 " of E1056.

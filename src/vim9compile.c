@@ -130,6 +130,8 @@ static int compile_expr1(char_u **arg,  cctx_T *cctx);
 static int compile_expr2(char_u **arg,  cctx_T *cctx);
 static int compile_expr3(char_u **arg,  cctx_T *cctx);
 static void delete_def_function_contents(dfunc_T *dfunc);
+static void arg_type_mismatch(type_T *expected, type_T *actual, int argidx);
+static int check_type(type_T *expected, type_T *actual, int give_msg);
 
 /*
  * Lookup variable "name" in the local scope and return the index.
@@ -302,6 +304,23 @@ get_dict_type(type_T *member_type, garray_T *type_gap)
 }
 
 /*
+ * Allocate a new type for a function.
+ */
+    static type_T *
+alloc_func_type(type_T *ret_type, int argcount, garray_T *type_gap)
+{
+    type_T *type = alloc_type(type_gap);
+
+    if (type == NULL)
+	return &t_any;
+    type->tt_type = VAR_FUNC;
+    type->tt_member = ret_type;
+    type->tt_argcount = argcount;
+    type->tt_args = NULL;
+    return type;
+}
+
+/*
  * Get a function type, based on the return type "ret_type".
  * If "argcount" is -1 or 0 a predefined type can be used.
  * If "argcount" > 0 always create a new type, so that arguments can be added.
@@ -309,11 +328,14 @@ get_dict_type(type_T *member_type, garray_T *type_gap)
     static type_T *
 get_func_type(type_T *ret_type, int argcount, garray_T *type_gap)
 {
-    type_T *type;
-
     // recognize commonly used types
     if (argcount <= 0)
     {
+	if (ret_type == &t_unknown)
+	{
+	    // (argcount == 0) is not possible
+	    return &t_func_unknown;
+	}
 	if (ret_type == &t_void)
 	{
 	    if (argcount == 0)
@@ -344,14 +366,7 @@ get_func_type(type_T *ret_type, int argcount, garray_T *type_gap)
 	}
     }
 
-    // Not a common type or has arguments, create a new entry.
-    type = alloc_type(type_gap);
-    if (type == NULL)
-	return &t_any;
-    type->tt_type = VAR_FUNC;
-    type->tt_member = ret_type;
-    type->tt_args = NULL;
-    return type;
+    return alloc_func_type(ret_type, argcount, type_gap);
 }
 
 /*
@@ -362,9 +377,10 @@ get_func_type(type_T *ret_type, int argcount, garray_T *type_gap)
 func_type_add_arg_types(
 	type_T	    *functype,
 	int	    argcount,
-	int	    min_argcount,
 	garray_T    *type_gap)
 {
+    // To make it easy to free the space needed for the argument types, add the
+    // pointer to type_gap.
     if (ga_grow(type_gap, 1) == FAIL)
 	return FAIL;
     functype->tt_args = ALLOC_CLEAR_MULT(type_T *, argcount);
@@ -373,9 +389,6 @@ func_type_add_arg_types(
     ((type_T **)type_gap->ga_data)[type_gap->ga_len] =
 						     (void *)functype->tt_args;
     ++type_gap->ga_len;
-
-    functype->tt_argcount = argcount;
-    functype->tt_min_argcount = min_argcount;
     return OK;
 }
 
@@ -388,14 +401,14 @@ typval2type(typval_T *tv)
     if (tv->v_type == VAR_NUMBER)
 	return &t_number;
     if (tv->v_type == VAR_BOOL)
-	return &t_bool;
+	return &t_bool;  // not used
     if (tv->v_type == VAR_STRING)
 	return &t_string;
     if (tv->v_type == VAR_LIST)  // e.g. for v:oldfiles
 	return &t_list_string;
     if (tv->v_type == VAR_DICT)  // e.g. for v:completed_item
 	return &t_dict_any;
-    return &t_any;
+    return &t_any;  // not used
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -634,7 +647,6 @@ generate_COMPARE(cctx_T *cctx, exptype_T exptype, int ic)
 	    case VAR_LIST: isntype = ISN_COMPARELIST; break;
 	    case VAR_DICT: isntype = ISN_COMPAREDICT; break;
 	    case VAR_FUNC: isntype = ISN_COMPAREFUNC; break;
-	    case VAR_PARTIAL: isntype = ISN_COMPAREPARTIAL; break;
 	    default: isntype = ISN_COMPAREANY; break;
 	}
     }
@@ -872,23 +884,6 @@ generate_PUSHFUNC(cctx_T *cctx, char_u *name, type_T *type)
 }
 
 /*
- * Generate an ISN_PUSHPARTIAL instruction with partial "part".
- * Consumes "part".
- */
-    static int
-generate_PUSHPARTIAL(cctx_T *cctx, partial_T *part)
-{
-    isn_T	*isn;
-
-    RETURN_OK_IF_SKIP(cctx);
-    if ((isn = generate_instr_type(cctx, ISN_PUSHPARTIAL, &t_func_any)) == NULL)
-	return FAIL;
-    isn->isn_arg.partial = part;
-
-    return OK;
-}
-
-/*
  * Generate an ISN_STORE instruction.
  */
     static int
@@ -966,7 +961,7 @@ generate_LOAD(
 }
 
 /*
- * Generate an ISN_LOADV instruction.
+ * Generate an ISN_LOADV instruction for v:var.
  */
     static int
 generate_LOADV(
@@ -974,8 +969,9 @@ generate_LOADV(
 	char_u	    *name,
 	int	    error)
 {
-    // load v:var
-    int vidx = find_vim_var(name);
+    int	    di_flags;
+    int	    vidx = find_vim_var(name, &di_flags);
+    type_T  *type;
 
     RETURN_OK_IF_SKIP(cctx);
     if (vidx < 0)
@@ -984,9 +980,9 @@ generate_LOADV(
 	    semsg(_(e_var_notfound), name);
 	return FAIL;
     }
+    type = typval2type(get_vim_var_tv(vidx));
 
-    // TODO: get actual type
-    return generate_LOAD(cctx, ISN_LOADV, vidx, NULL, &t_any);
+    return generate_LOAD(cctx, ISN_LOADV, vidx, NULL, type);
 }
 
 /*
@@ -1234,17 +1230,29 @@ generate_CALL(cctx_T *cctx, ufunc_T *ufunc, int pushed_argcount)
 	return FAIL;
     }
 
-    // Turn varargs into a list.
-    if (ufunc->uf_va_name != NULL)
+    if (ufunc->uf_dfunc_idx >= 0)
     {
-	int count = argcount - regular_args;
+	int		i;
 
-	// If count is negative an empty list will be added after evaluating
-	// default values for missing optional arguments.
-	if (count >= 0)
+	for (i = 0; i < argcount; ++i)
 	{
-	    generate_NEWLIST(cctx, count);
-	    argcount = regular_args + 1;
+	    type_T *expected;
+	    type_T *actual;
+
+	    if (i < regular_args)
+	    {
+		if (ufunc->uf_arg_types == NULL)
+		    continue;
+		expected = ufunc->uf_arg_types[i];
+	    }
+	    else
+		expected = ufunc->uf_va_type->tt_member;
+	    actual = ((type_T **)stack->ga_data)[stack->ga_len - argcount + i];
+	    if (check_type(expected, actual, FALSE) == FAIL)
+	    {
+		arg_type_mismatch(expected, actual, i + 1);
+		return FAIL;
+	    }
 	}
     }
 
@@ -1309,6 +1317,7 @@ generate_PCALL(cctx_T *cctx, int argcount, int at_top)
     garray_T	*stack = &cctx->ctx_type_stack;
 
     RETURN_OK_IF_SKIP(cctx);
+
     if ((isn = generate_instr(cctx, ISN_PCALL)) == NULL)
 	return FAIL;
     isn->isn_arg.pfunc.cpf_top = at_top;
@@ -1589,13 +1598,13 @@ parse_type(char_u **arg, garray_T *type_gap)
 	    if (len == 4 && STRNCMP(*arg, "func", len) == 0)
 	    {
 		type_T  *type;
-		type_T  *ret_type = &t_any;
+		type_T  *ret_type = &t_unknown;
 		int	argcount = -1;
 		int	flags = 0;
 		int	first_optional = -1;
 		type_T	*arg_type[MAX_FUNC_ARGS + 1];
 
-		// func({type}, ...): {type}
+		// func({type}, ...{type}): {type}
 		*arg += len;
 		if (**arg == '(')
 		{
@@ -1607,13 +1616,6 @@ parse_type(char_u **arg, garray_T *type_gap)
 		    argcount = 0;
 		    while (*p != NUL && *p != ')')
 		    {
-			if (STRNCMP(p, "...", 3) == 0)
-			{
-			    flags |= TTFLAG_VARARGS;
-			    break;
-			}
-			arg_type[argcount++] = parse_type(&p, type_gap);
-
 			if (*p == '?')
 			{
 			    if (first_optional == -1)
@@ -1625,6 +1627,17 @@ parse_type(char_u **arg, garray_T *type_gap)
 			    emsg(_("E1007: mandatory argument after optional argument"));
 			    return &t_any;
 			}
+			else if (STRNCMP(p, "...", 3) == 0)
+			{
+			    flags |= TTFLAG_VARARGS;
+			    p += 3;
+			}
+
+			arg_type[argcount++] = parse_type(&p, type_gap);
+
+			// Nothing comes after "...{type}".
+			if (flags & TTFLAG_VARARGS)
+			    break;
 
 			if (*p != ',' && *skipwhite(p) == ',')
 			{
@@ -1635,7 +1648,10 @@ parse_type(char_u **arg, garray_T *type_gap)
 			{
 			    ++p;
 			    if (!VIM_ISWHITE(*p))
+			    {
 				semsg(_(e_white_after), ",");
+				return &t_any;
+			    }
 			}
 			p = skipwhite(p);
 			if (argcount == MAX_FUNC_ARGS)
@@ -1657,24 +1673,28 @@ parse_type(char_u **arg, garray_T *type_gap)
 		{
 		    // parse return type
 		    ++*arg;
-		    if (!VIM_ISWHITE(*p))
+		    if (!VIM_ISWHITE(**arg))
 			semsg(_(e_white_after), ":");
 		    *arg = skipwhite(*arg);
 		    ret_type = parse_type(arg, type_gap);
 		}
-		type = get_func_type(ret_type,
-			    flags == 0 && first_optional == -1 ? argcount : 99,
-								    type_gap);
-		if (flags != 0)
-		    type->tt_flags = flags;
-		if (argcount > 0)
+		if (flags == 0 && first_optional == -1 && argcount <= 0)
+		    type = get_func_type(ret_type, argcount, type_gap);
+		else
 		{
-		    if (func_type_add_arg_types(type, argcount,
-			    first_optional == -1 ? argcount : first_optional,
+		    type = alloc_func_type(ret_type, argcount, type_gap);
+		    type->tt_flags = flags;
+		    if (argcount > 0)
+		    {
+			type->tt_argcount = argcount;
+			type->tt_min_argcount = first_optional == -1
+						   ? argcount : first_optional;
+			if (func_type_add_arg_types(type, argcount,
 							     type_gap) == FAIL)
-			return &t_any;
-		    mch_memmove(type->tt_args, arg_type,
+			    return &t_any;
+			mch_memmove(type->tt_args, arg_type,
 						  sizeof(type_T *) * argcount);
+		    }
 		}
 		return type;
 	    }
@@ -1726,6 +1746,8 @@ parse_type(char_u **arg, garray_T *type_gap)
     static int
 equal_type(type_T *type1, type_T *type2)
 {
+    int i;
+
     if (type1->tt_type != type2->tt_type)
 	return FALSE;
     switch (type1->tt_type)
@@ -1747,9 +1769,16 @@ equal_type(type_T *type1, type_T *type2)
 	    return equal_type(type1->tt_member, type2->tt_member);
 	case VAR_FUNC:
 	case VAR_PARTIAL:
-	    // TODO; check argument types.
-	    return equal_type(type1->tt_member, type2->tt_member)
-		&& type1->tt_argcount == type2->tt_argcount;
+	    if (!equal_type(type1->tt_member, type2->tt_member)
+		    || type1->tt_argcount != type2->tt_argcount)
+		return FALSE;
+	    if (type1->tt_argcount < 0
+			   || type1->tt_args == NULL || type2->tt_args == NULL)
+		return TRUE;
+	    for (i = 0; i < type1->tt_argcount; ++i)
+		if (!equal_type(type1->tt_args[i], type2->tt_args[i]))
+		    return FALSE;
+	    return TRUE;
     }
     return TRUE;
 }
@@ -1780,8 +1809,31 @@ common_type(type_T *type1, type_T *type2, type_T **dest, garray_T *type_gap)
 		*dest = get_dict_type(common, type_gap);
 	    return;
 	}
-	// TODO: VAR_FUNC and VAR_PARTIAL
-	*dest = type1;
+	if (type1->tt_type == VAR_FUNC)
+	{
+	    type_T *common;
+
+	    common_type(type1->tt_member, type2->tt_member, &common, type_gap);
+	    if (type1->tt_argcount == type2->tt_argcount
+						    && type1->tt_argcount >= 0)
+	    {
+		int argcount = type1->tt_argcount;
+		int i;
+
+		*dest = alloc_func_type(common, argcount, type_gap);
+		if (type1->tt_args != NULL && type2->tt_args != NULL)
+		{
+		    if (func_type_add_arg_types(*dest, argcount,
+							     type_gap) == OK)
+			for (i = 0; i < argcount; ++i)
+			    common_type(type1->tt_args[i], type2->tt_args[i],
+					       &(*dest)->tt_args[i], type_gap);
+		}
+	    }
+	    else
+		*dest = alloc_func_type(common, -1, type_gap);
+	    return;
+	}
     }
 
     *dest = &t_any;
@@ -1805,8 +1857,9 @@ vartype_name(vartype_T type)
 	case VAR_CHANNEL: return "channel";
 	case VAR_LIST: return "list";
 	case VAR_DICT: return "dict";
-	case VAR_FUNC: return "func";
-	case VAR_PARTIAL: return "partial";
+
+	case VAR_FUNC:
+	case VAR_PARTIAL: return "func";
     }
     return "unknown";
 }
@@ -1836,10 +1889,11 @@ type_name(type_T *type, char **tofree)
 	    return *tofree;
 	}
     }
-    if (type->tt_type == VAR_FUNC || type->tt_type == VAR_PARTIAL)
+    if (type->tt_type == VAR_FUNC)
     {
 	garray_T    ga;
 	int	    i;
+	int	    varargs = (type->tt_flags & TTFLAG_VARARGS) ? 1 : 0;
 
 	ga_init2(&ga, 1, 100);
 	if (ga_grow(&ga, 20) == FAIL)
@@ -1851,21 +1905,32 @@ type_name(type_T *type, char **tofree)
 	for (i = 0; i < type->tt_argcount; ++i)
 	{
 	    char *arg_free;
-	    char *arg_type = type_name(type->tt_args[i], &arg_free);
+	    char *arg_type;
 	    int  len;
 
+	    if (type->tt_args == NULL)
+		arg_type = "[unknown]";
+	    else
+		arg_type = type_name(type->tt_args[i], &arg_free);
 	    if (i > 0)
 	    {
 		STRCPY((char *)ga.ga_data + ga.ga_len, ", ");
 		ga.ga_len += 2;
 	    }
 	    len = (int)STRLEN(arg_type);
-	    if (ga_grow(&ga, len + 6) == FAIL)
+	    if (ga_grow(&ga, len + 8) == FAIL)
 	    {
 		vim_free(arg_free);
 		return "[unknown]";
 	    }
 	    *tofree = ga.ga_data;
+	    if (varargs && i == type->tt_argcount - 1)
+	    {
+		STRCPY((char *)ga.ga_data + ga.ga_len, "...");
+		ga.ga_len += 3;
+	    }
+	    else if (i >= type->tt_min_argcount)
+		*((char *)ga.ga_data + ga.ga_len++) = '?';
 	    STRCPY((char *)ga.ga_data + ga.ga_len, arg_type);
 	    ga.ga_len += len;
 	    vim_free(arg_free);
@@ -1981,6 +2046,55 @@ free_imported(cctx_T *cctx)
 	vim_free(import->imp_name);
     }
     ga_clear(&cctx->ctx_imports);
+}
+
+/*
+ * Get the next line of the function from "cctx".
+ * Returns NULL when at the end.
+ */
+    static char_u *
+next_line_from_context(cctx_T *cctx)
+{
+    char_u	*line = NULL;
+
+    do
+    {
+	++cctx->ctx_lnum;
+	if (cctx->ctx_lnum >= cctx->ctx_ufunc->uf_lines.ga_len)
+	    break;
+	line = ((char_u **)cctx->ctx_ufunc->uf_lines.ga_data)[cctx->ctx_lnum];
+	SOURCING_LNUM = cctx->ctx_ufunc->uf_script_ctx.sc_lnum
+							  + cctx->ctx_lnum + 1;
+    } while (line == NULL || *skipwhite(line) == NUL);
+    return line;
+}
+
+/*
+ * Return TRUE if "p" points at a "#" but not at "#{".
+ */
+    static int
+comment_start(char_u *p)
+{
+    return p[0] == '#' && p[1] != '{';
+}
+
+/*
+ * If "*arg" is at the end of the line, advance to the next line.
+ * Also when "whitep" points to white space and "*arg" is on a "#".
+ * Return FAIL if beyond the last line, "*arg" is unmodified then.
+ */
+    static int
+may_get_next_line(char_u *whitep, char_u **arg, cctx_T *cctx)
+{
+    if (**arg == NUL || (VIM_ISWHITE(*whitep) && comment_start(*arg)))
+    {
+	char_u *next = next_line_from_context(cctx);
+
+	if (next == NULL)
+	    return FAIL;
+	*arg = skipwhite(next);
+    }
+    return OK;
 }
 
 /*
@@ -2217,10 +2331,25 @@ theend:
     static int
 compile_arguments(char_u **arg, cctx_T *cctx, int *argcount)
 {
-    char_u *p = *arg;
+    char_u  *p = *arg;
+    char_u  *whitep = *arg;
 
-    while (*p != NUL && *p != ')')
+    for (;;)
     {
+	while (*p == NUL || (VIM_ISWHITE(*whitep) && comment_start(p)))
+	{
+	    p = next_line_from_context(cctx);
+	    if (p == NULL)
+		goto failret;
+	    whitep = (char_u *)" ";
+	    p = skipwhite(p);
+	}
+	if (*p == ')')
+	{
+	    *arg = p + 1;
+	    return OK;
+	}
+
 	if (compile_expr1(&p, cctx) == FAIL)
 	    return FAIL;
 	++*argcount;
@@ -2233,19 +2362,15 @@ compile_arguments(char_u **arg, cctx_T *cctx, int *argcount)
 	if (*p == ',')
 	{
 	    ++p;
-	    if (!VIM_ISWHITE(*p))
+	    if (*p != NUL && !VIM_ISWHITE(*p))
 		semsg(_(e_white_after), ",");
 	}
+	whitep = p;
 	p = skipwhite(p);
     }
-    p = skipwhite(p);
-    if (*p != ')')
-    {
-	emsg(_(e_missing_close));
-	return FAIL;
-    }
-    *arg = p + 1;
-    return OK;
+failret:
+    emsg(_(e_missing_close));
+    return FAIL;
 }
 
 /*
@@ -2397,6 +2522,18 @@ type_mismatch(type_T *expected, type_T *actual)
     vim_free(tofree2);
 }
 
+    static void
+arg_type_mismatch(type_T *expected, type_T *actual, int argidx)
+{
+    char *tofree1, *tofree2;
+
+    semsg(_("E1013: argument %d: type mismatch, expected %s but got %s"),
+	    argidx,
+	    type_name(expected, &tofree1), type_name(actual, &tofree2));
+    vim_free(tofree1);
+    vim_free(tofree2);
+}
+
 /*
  * Check if the expected and actual types match.
  */
@@ -2405,7 +2542,10 @@ check_type(type_T *expected, type_T *actual, int give_msg)
 {
     int ret = OK;
 
-    if (expected->tt_type != VAR_UNKNOWN && expected->tt_type != VAR_ANY)
+    // When expected is "unknown" we accept any actual type.
+    // When expected is "any" we accept any actual type except "void".
+    if (expected->tt_type != VAR_UNKNOWN
+	    && (expected->tt_type != VAR_ANY || actual->tt_type == VAR_VOID))
     {
 	if (expected->tt_type != actual->tt_type)
 	{
@@ -2421,8 +2561,7 @@ check_type(type_T *expected, type_T *actual, int give_msg)
 	}
 	else if (expected->tt_type == VAR_FUNC)
 	{
-	    if (expected->tt_member != &t_any
-					  && expected->tt_member != &t_unknown)
+	    if (expected->tt_member != &t_unknown)
 		ret = check_type(expected->tt_member, actual->tt_member, FALSE);
 	    if (ret == OK && expected->tt_argcount != -1
 		    && (actual->tt_argcount < expected->tt_min_argcount
@@ -2463,23 +2602,39 @@ need_type(type_T *actual, type_T *expected, int offset, cctx_T *cctx)
 compile_list(char_u **arg, cctx_T *cctx)
 {
     char_u	*p = skipwhite(*arg + 1);
+    char_u	*whitep = *arg + 1;
     int		count = 0;
 
-    while (*p != ']')
+    for (;;)
     {
-	if (*p == NUL)
+	while (*p == NUL || (VIM_ISWHITE(*whitep) && comment_start(p)))
 	{
-	    semsg(_(e_list_end), *arg);
-	    return FAIL;
+	    p = next_line_from_context(cctx);
+	    if (p == NULL)
+	    {
+		semsg(_(e_list_end), *arg);
+		return FAIL;
+	    }
+	    whitep = (char_u *)" ";
+	    p = skipwhite(p);
+	}
+	if (*p == ']')
+	{
+	    ++p;
+	    // Allow for following comment, after at least one space.
+	    if (VIM_ISWHITE(*p) && *skipwhite(p) == '"')
+		p += STRLEN(p);
+	    break;
 	}
 	if (compile_expr1(&p, cctx) == FAIL)
 	    break;
 	++count;
 	if (*p == ',')
 	    ++p;
+	whitep = p;
 	p = skipwhite(p);
     }
-    *arg = p + 1;
+    *arg = p;
 
     generate_NEWLIST(cctx, count);
     return OK;
@@ -2574,27 +2729,42 @@ compile_dict(char_u **arg, cctx_T *cctx, int literal)
     int		count = 0;
     dict_T	*d = dict_alloc();
     dictitem_T	*item;
+    char_u	*whitep = *arg;
+    char_u	*p;
 
     if (d == NULL)
 	return FAIL;
     *arg = skipwhite(*arg + 1);
-    while (**arg != '}' && **arg != NUL)
+    for (;;)
     {
 	char_u *key = NULL;
 
+	while (**arg == NUL || (literal && **arg == '"')
+			      || (VIM_ISWHITE(*whitep) && comment_start(*arg)))
+	{
+	    *arg = next_line_from_context(cctx);
+	    if (*arg == NULL)
+		goto failret;
+	    whitep = (char_u *)" ";
+	    *arg = skipwhite(*arg);
+	}
+
+	if (**arg == '}')
+	    break;
+
 	if (literal)
 	{
-	    char_u *p = to_name_end(*arg, !literal);
+	    char_u *end = to_name_end(*arg, !literal);
 
-	    if (p == *arg)
+	    if (end == *arg)
 	    {
 		semsg(_("E1014: Invalid key: %s"), *arg);
 		return FAIL;
 	    }
-	    key = vim_strnsave(*arg, p - *arg);
+	    key = vim_strnsave(*arg, end - *arg);
 	    if (generate_PUSHS(cctx, key) == FAIL)
 		return FAIL;
-	    *arg = p;
+	    *arg = end;
 	}
 	else
 	{
@@ -2634,11 +2804,32 @@ compile_dict(char_u **arg, cctx_T *cctx, int literal)
 	    return FAIL;
 	}
 
+	whitep = *arg + 1;
 	*arg = skipwhite(*arg + 1);
+	while (**arg == NUL || (VIM_ISWHITE(*whitep) && comment_start(*arg)))
+	{
+	    *arg = next_line_from_context(cctx);
+	    if (*arg == NULL)
+		goto failret;
+	    whitep = (char_u *)" ";
+	    *arg = skipwhite(*arg);
+	}
+
 	if (compile_expr1(arg, cctx) == FAIL)
 	    return FAIL;
 	++count;
 
+	whitep = *arg;
+	p = skipwhite(*arg);
+	while (*p == NUL || (VIM_ISWHITE(*whitep) && comment_start(p)))
+	{
+	    *arg = next_line_from_context(cctx);
+	    if (*arg == NULL)
+		goto failret;
+	    whitep = (char_u *)" ";
+	    *arg = skipwhite(*arg);
+	    p = *arg;
+	}
 	if (**arg == '}')
 	    break;
 	if (**arg != ',')
@@ -2646,20 +2837,23 @@ compile_dict(char_u **arg, cctx_T *cctx, int literal)
 	    semsg(_(e_missing_dict_comma), *arg);
 	    goto failret;
 	}
+	whitep = *arg + 1;
 	*arg = skipwhite(*arg + 1);
     }
 
-    if (**arg != '}')
-    {
-	semsg(_(e_missing_dict_end), *arg);
-	goto failret;
-    }
     *arg = *arg + 1;
+
+    // Allow for following comment, after at least one space.
+    p = skipwhite(*arg);
+    if (VIM_ISWHITE(**arg) && (*p == '"' || comment_start(p)))
+	*arg += STRLEN(*arg);
 
     dict_unref(d);
     return generate_NEWDICT(cctx, count);
 
 failret:
+    if (*arg == NULL)
+	semsg(_(e_missing_dict_end), _("[end of lines]"));
     dict_unref(d);
     return FAIL;
 }
@@ -3109,8 +3303,9 @@ compile_expr7(char_u **arg, cctx_T *cctx)
 			char_u *start = skipwhite(*arg + 1);
 
 			// Find out what comes after the arguments.
+			// TODO: pass getline function
 			ret = get_function_args(&start, '-', NULL,
-						       NULL, NULL, NULL, TRUE);
+					   NULL, NULL, NULL, TRUE, NULL, NULL);
 			if (ret != FAIL && *start == '>')
 			    ret = compile_lambda(arg, cctx);
 			else
@@ -3246,14 +3441,17 @@ compile_expr6(char_u **arg, cctx_T *cctx)
 	op = skipwhite(*arg);
 	if (*op != '*' && *op != '/' && *op != '%')
 	    break;
-	if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(op[1]))
+	if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(op[1]))
 	{
 	    char_u buf[3];
 
 	    vim_strncpy(buf, op, 1);
 	    semsg(_(e_white_both), buf);
+	    return FAIL;
 	}
 	*arg = skipwhite(op + 1);
+	if (may_get_next_line(op + 1, arg, cctx) == FAIL)
+	    return FAIL;
 
 	// get the second variable
 	if (compile_expr7(arg, cctx) == FAIL)
@@ -3290,15 +3488,18 @@ compile_expr5(char_u **arg, cctx_T *cctx)
 	    break;
 	oplen = (*op == '.' ? 2 : 1);
 
-	if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(op[oplen]))
+	if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(op[oplen]))
 	{
 	    char_u buf[3];
 
 	    vim_strncpy(buf, op, oplen);
 	    semsg(_(e_white_both), buf);
+	    return FAIL;
 	}
 
 	*arg = skipwhite(op + oplen);
+	if (may_get_next_line(op + oplen, arg, cctx) == FAIL)
+	    return FAIL;
 
 	// get the second variable
 	if (compile_expr6(arg, cctx) == FAIL)
@@ -3424,16 +3625,20 @@ compile_expr4(char_u **arg, cctx_T *cctx)
 	    ++len;
 	// nothing appended: match case
 
-	if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(p[len]))
+	if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(p[len]))
 	{
 	    char_u buf[7];
 
 	    vim_strncpy(buf, p, len);
 	    semsg(_(e_white_both), buf);
+	    return FAIL;
 	}
 
 	// get the second variable
 	*arg = skipwhite(p + len);
+	if (may_get_next_line(p + len, arg, cctx) == FAIL)
+	    return FAIL;
+
 	if (compile_expr5(arg, cctx) == FAIL)
 	    return FAIL;
 
@@ -3463,8 +3668,11 @@ compile_and_or(char_u **arg, cctx_T *cctx, char *op)
 	ga_init2(&end_ga, sizeof(int), 10);
 	while (p[0] == opchar && p[1] == opchar)
 	{
-	    if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(p[2]))
+	    if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(p[2]))
+	    {
 		semsg(_(e_white_both), op);
+		return FAIL;
+	    }
 
 	    if (ga_grow(&end_ga, 1) == FAIL)
 	    {
@@ -3478,6 +3686,9 @@ compile_and_or(char_u **arg, cctx_T *cctx, char *op)
 
 	    // eval the next expression
 	    *arg = skipwhite(p + 2);
+	    if (may_get_next_line(p + 2, arg, cctx) == FAIL)
+		return FAIL;
+
 	    if ((opchar == '|' ? compile_expr3(arg, cctx)
 					   : compile_expr4(arg, cctx)) == FAIL)
 	    {
@@ -3578,13 +3789,19 @@ compile_expr1(char_u **arg,  cctx_T *cctx)
 	type_T		*type1;
 	type_T		*type2;
 
-	if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(p[1]))
+	if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(p[1]))
+	{
 	    semsg(_(e_white_both), "?");
+	    return FAIL;
+	}
 
 	generate_JUMP(cctx, JUMP_IF_FALSE, 0);
 
 	// evaluate the second expression; any type is accepted
 	*arg = skipwhite(p + 1);
+	if (may_get_next_line(p + 1, arg, cctx) == FAIL)
+	    return FAIL;
+
 	if (compile_expr1(arg, cctx) == FAIL)
 	    return FAIL;
 
@@ -3606,11 +3823,17 @@ compile_expr1(char_u **arg,  cctx_T *cctx)
 	    emsg(_(e_missing_colon));
 	    return FAIL;
 	}
-	if (!VIM_ISWHITE(**arg) || !VIM_ISWHITE(p[1]))
+	if (!IS_WHITE_OR_NUL(**arg) || !IS_WHITE_OR_NUL(p[1]))
+	{
 	    semsg(_(e_white_both), ":");
+	    return FAIL;
+	}
 
 	// evaluate the third expression
 	*arg = skipwhite(p + 1);
+	if (may_get_next_line(p + 1, arg, cctx) == FAIL)
+	    return FAIL;
+
 	if (compile_expr1(arg, cctx) == FAIL)
 	    return FAIL;
 
@@ -3859,14 +4082,18 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	}
 	else if (STRNCMP(arg, "v:", 2) == 0)
 	{
-	    typval_T *vtv;
+	    typval_T	*vtv;
+	    int		di_flags;
 
-	    vimvaridx = find_vim_var(name + 2);
+	    vimvaridx = find_vim_var(name + 2, &di_flags);
 	    if (vimvaridx < 0)
 	    {
 		semsg(_(e_var_notfound), arg);
 		goto theend;
 	    }
+	    // We use the current value of "sandbox" here, is that OK?
+	    if (var_check_ro(di_flags, name, FALSE))
+		goto theend;
 	    dest = dest_vimvar;
 	    vtv = get_vim_var_tv(vimvaridx);
 	    type = typval2type(vtv);
@@ -3964,8 +4191,7 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	}
 
 	// new local variable
-	if ((type->tt_type == VAR_FUNC || type->tt_type == VAR_PARTIAL)
-					    && var_check_func_name(name, TRUE))
+	if (type->tt_type == VAR_FUNC && var_check_func_name(name, TRUE))
 	    goto theend;
 	idx = reserve_local(cctx, arg, varlen, cmdidx == CMD_const, type);
 	if (idx < 0)
@@ -3981,7 +4207,7 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	// [let] varname =<< [trim] {end}
 	eap->getline = heredoc_getline;
 	eap->cookie = cctx;
-	l = heredoc_get(eap, op + 3);
+	l = heredoc_get(eap, op + 3, FALSE);
 
 	// Push each line and the create the list.
 	FOR_ALL_LIST_ITEMS(l, li)
@@ -4044,36 +4270,39 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	if (r == FAIL)
 	    goto theend;
 
-	stack = &cctx->ctx_type_stack;
-	stacktype = stack->ga_len == 0 ? &t_void
-			      : ((type_T **)stack->ga_data)[stack->ga_len - 1];
-	if (idx >= 0 && (is_decl || !has_type))
+	if (cctx->ctx_skip != TRUE)
 	{
-	    lvar = ((lvar_T *)cctx->ctx_locals.ga_data) + idx;
-	    if (new_local && !has_type)
+	    stack = &cctx->ctx_type_stack;
+	    stacktype = stack->ga_len == 0 ? &t_void
+			      : ((type_T **)stack->ga_data)[stack->ga_len - 1];
+	    if (idx >= 0 && (is_decl || !has_type))
 	    {
-		if (stacktype->tt_type == VAR_VOID)
+		lvar = ((lvar_T *)cctx->ctx_locals.ga_data) + idx;
+		if (new_local && !has_type)
 		{
-		    emsg(_("E1031: Cannot use void value"));
-		    goto theend;
-		}
-		else
-		{
-		    // An empty list or dict has a &t_void member, for a
-		    // variable that implies &t_any.
-		    if (stacktype == &t_list_empty)
-			lvar->lv_type = &t_list_any;
-		    else if (stacktype == &t_dict_empty)
-			lvar->lv_type = &t_dict_any;
+		    if (stacktype->tt_type == VAR_VOID)
+		    {
+			emsg(_("E1031: Cannot use void value"));
+			goto theend;
+		    }
 		    else
-			lvar->lv_type = stacktype;
+		    {
+			// An empty list or dict has a &t_void member, for a
+			// variable that implies &t_any.
+			if (stacktype == &t_list_empty)
+			    lvar->lv_type = &t_list_any;
+			else if (stacktype == &t_dict_empty)
+			    lvar->lv_type = &t_dict_any;
+			else
+			    lvar->lv_type = stacktype;
+		    }
 		}
+		else if (need_type(stacktype, lvar->lv_type, -1, cctx) == FAIL)
+		    goto theend;
 	    }
-	    else if (need_type(stacktype, lvar->lv_type, -1, cctx) == FAIL)
+	    else if (*p != '=' && check_type(type, stacktype, TRUE) == FAIL)
 		goto theend;
 	}
-	else if (*p != '=' && check_type(type, stacktype, TRUE) == FAIL)
-	    goto theend;
     }
     else if (cmdidx == CMD_const)
     {
@@ -4109,9 +4338,6 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	    case VAR_FUNC:
 		generate_PUSHFUNC(cctx, NULL, &t_func_void);
 		break;
-	    case VAR_PARTIAL:
-		generate_PUSHPARTIAL(cctx, NULL);
-		break;
 	    case VAR_LIST:
 		generate_NEWLIST(cctx, 0);
 		break;
@@ -4127,6 +4353,7 @@ compile_assignment(char_u *arg, exarg_T *eap, cmdidx_T cmdidx, cctx_T *cctx)
 	    case VAR_NUMBER:
 	    case VAR_UNKNOWN:
 	    case VAR_ANY:
+	    case VAR_PARTIAL:
 	    case VAR_VOID:
 	    case VAR_SPECIAL:  // cannot happen
 		generate_PUSHNR(cctx, 0);
@@ -5473,7 +5700,7 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 	    if (ga_grow(&def_functions, 1) == FAIL)
 		return;
 	    dfunc = ((dfunc_T *)def_functions.ga_data) + def_functions.ga_len;
-	    vim_memset(dfunc, 0, sizeof(dfunc_T));
+	    CLEAR_POINTER(dfunc);
 	    dfunc->df_idx = def_functions.ga_len;
 	    ufunc->uf_dfunc_idx = dfunc->df_idx;
 	    dfunc->df_ufunc = ufunc;
@@ -5481,7 +5708,7 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 	}
     }
 
-    vim_memset(&cctx, 0, sizeof(cctx));
+    CLEAR_FIELD(cctx);
     cctx.ctx_ufunc = ufunc;
     cctx.ctx_lnum = -1;
     ga_init2(&cctx.ctx_locals, sizeof(lvar_T), 10);
@@ -5497,6 +5724,7 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
     if (ufunc->uf_def_args.ga_len > 0)
     {
 	int	count = ufunc->uf_def_args.ga_len;
+	int	first_def_arg = ufunc->uf_args.ga_len - count;
 	int	i;
 	char_u	*arg;
 	int	off = STACK_FRAME_SIZE + (ufunc->uf_va_name != NULL ? 1 : 0);
@@ -5510,22 +5738,32 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 	    goto erret;
 	for (i = 0; i < count; ++i)
 	{
+	    garray_T	*stack = &cctx.ctx_type_stack;
+	    type_T	*val_type;
+	    int		arg_idx = first_def_arg + i;
+
 	    ufunc->uf_def_arg_idx[i] = instr->ga_len;
 	    arg = ((char_u **)(ufunc->uf_def_args.ga_data))[i];
-	    if (compile_expr1(&arg, &cctx) == FAIL
-		    || generate_STORE(&cctx, ISN_STORE,
-						i - count - off, NULL) == FAIL)
+	    if (compile_expr1(&arg, &cctx) == FAIL)
+		goto erret;
+
+	    // If no type specified use the type of the default value.
+	    // Otherwise check that the default value type matches the
+	    // specified type.
+	    val_type = ((type_T **)stack->ga_data)[stack->ga_len - 1];
+	    if (ufunc->uf_arg_types[arg_idx] == &t_unknown)
+		ufunc->uf_arg_types[arg_idx] = val_type;
+	    else if (check_type(ufunc->uf_arg_types[i], val_type, FALSE)
+								       == FAIL)
+	    {
+		arg_type_mismatch(ufunc->uf_arg_types[arg_idx], val_type,
+								  arg_idx + 1);
+		goto erret;
+	    }
+
+	    if (generate_STORE(&cctx, ISN_STORE, i - count - off, NULL) == FAIL)
 		goto erret;
 	}
-
-	// If a varargs is following, push an empty list.
-	if (ufunc->uf_va_name != NULL)
-	{
-	    if (generate_NEWLIST(&cctx, 0) == FAIL
-		    || generate_STORE(&cctx, ISN_STORE, -off, NULL) == FAIL)
-		goto erret;
-	}
-
 	ufunc->uf_def_arg_idx[count] = instr->ga_len;
     }
 
@@ -5534,7 +5772,7 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
      */
     for (;;)
     {
-	int	is_ex_command;
+	int	is_ex_command = FALSE;
 
 	// Bail out on the first error to avoid a flood of errors and report
 	// the right line number when inside try/catch.
@@ -5551,53 +5789,65 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 	}
 	else
 	{
-	    do
-	    {
-		++cctx.ctx_lnum;
-		if (cctx.ctx_lnum == ufunc->uf_lines.ga_len)
-		    break;
-		line = ((char_u **)ufunc->uf_lines.ga_data)[cctx.ctx_lnum];
-	    } while (line == NULL);
-	    if (cctx.ctx_lnum == ufunc->uf_lines.ga_len)
+	    line = next_line_from_context(&cctx);
+	    if (cctx.ctx_lnum >= ufunc->uf_lines.ga_len)
+		// beyond the last line
 		break;
-	    SOURCING_LNUM = ufunc->uf_script_ctx.sc_lnum + cctx.ctx_lnum + 1;
 	}
 	emsg_before = called_emsg;
 
 	had_return = FALSE;
-	vim_memset(&ea, 0, sizeof(ea));
+	CLEAR_FIELD(ea);
 	ea.cmdlinep = &line;
 	ea.cmd = skipwhite(line);
 
-	// "}" ends a block scope
-	if (*ea.cmd == '}')
+	// Some things can be recognized by the first character.
+	switch (*ea.cmd)
 	{
-	    scopetype_T stype = cctx.ctx_scope == NULL
-					 ? NO_SCOPE : cctx.ctx_scope->se_type;
+	    case '#':
+		// "#" starts a comment, but not "#{".
+		if (ea.cmd[1] != '{')
+		{
+		    line = (char_u *)"";
+		    continue;
+		}
+		break;
 
-	    if (stype == BLOCK_SCOPE)
-	    {
-		compile_endblock(&cctx);
-		line = ea.cmd;
-	    }
-	    else
-	    {
-		emsg(_("E1025: using } outside of a block scope"));
-		goto erret;
-	    }
-	    if (line != NULL)
-		line = skipwhite(ea.cmd + 1);
-	    continue;
-	}
+	    case '}':
+		{
+		    // "}" ends a block scope
+		    scopetype_T stype = cctx.ctx_scope == NULL
+					  ? NO_SCOPE : cctx.ctx_scope->se_type;
 
-	// "{" starts a block scope
-	// "{'a': 1}->func() is something else
-	if (*ea.cmd == '{' && ends_excmd(*skipwhite(ea.cmd + 1)))
-	{
-	    line = compile_block(ea.cmd, &cctx);
-	    continue;
+		    if (stype == BLOCK_SCOPE)
+		    {
+			compile_endblock(&cctx);
+			line = ea.cmd;
+		    }
+		    else
+		    {
+			emsg(_("E1025: using } outside of a block scope"));
+			goto erret;
+		    }
+		    if (line != NULL)
+			line = skipwhite(ea.cmd + 1);
+		    continue;
+		}
+
+	    case '{':
+		// "{" starts a block scope
+		// "{'a': 1}->func() is something else
+		if (ends_excmd(*skipwhite(ea.cmd + 1)))
+		{
+		    line = compile_block(ea.cmd, &cctx);
+		    continue;
+		}
+		break;
+
+	    case ':':
+		is_ex_command = TRUE;
+		break;
 	}
-	is_ex_command = *ea.cmd == ':';
 
 	/*
 	 * COMMAND MODIFIERS
@@ -5838,24 +6088,27 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 
     {
 	int varargs = ufunc->uf_va_name != NULL;
-	int argcount = ufunc->uf_args.ga_len - (varargs ? 1 : 0);
+	int argcount = ufunc->uf_args.ga_len;
 
 	// Create a type for the function, with the return type and any
 	// argument types.
 	// A vararg is included in uf_args.ga_len but not in uf_arg_types.
 	// The type is included in "tt_args".
-	ufunc->uf_func_type = get_func_type(ufunc->uf_ret_type,
-				  ufunc->uf_args.ga_len, &ufunc->uf_type_list);
-	if (ufunc->uf_args.ga_len > 0)
+	if (argcount > 0 || varargs)
 	{
+	    ufunc->uf_func_type = alloc_func_type(ufunc->uf_ret_type,
+					       argcount, &ufunc->uf_type_list);
+	    // Add argument types to the function type.
 	    if (func_type_add_arg_types(ufunc->uf_func_type,
-			ufunc->uf_args.ga_len,
-			argcount - ufunc->uf_def_args.ga_len,
-						 &ufunc->uf_type_list) == FAIL)
+					argcount + varargs,
+					&ufunc->uf_type_list) == FAIL)
 	    {
 		ret = FAIL;
 		goto erret;
 	    }
+	    ufunc->uf_func_type->tt_argcount = argcount + varargs;
+	    ufunc->uf_func_type->tt_min_argcount =
+					  argcount - ufunc->uf_def_args.ga_len;
 	    if (ufunc->uf_arg_types == NULL)
 	    {
 		int i;
@@ -5868,9 +6121,17 @@ compile_def_function(ufunc_T *ufunc, int set_return_type)
 		mch_memmove(ufunc->uf_func_type->tt_args,
 			     ufunc->uf_arg_types, sizeof(type_T *) * argcount);
 	    if (varargs)
+	    {
 		ufunc->uf_func_type->tt_args[argcount] =
 			ufunc->uf_va_type == NULL ? &t_any : ufunc->uf_va_type;
+		ufunc->uf_func_type->tt_flags = TTFLAG_VARARGS;
+	    }
 	}
+	else
+	    // No arguments, can use a predefined type.
+	    ufunc->uf_func_type = get_func_type(ufunc->uf_ret_type,
+					       argcount, &ufunc->uf_type_list);
+
     }
 
     ret = OK;
@@ -5942,10 +6203,6 @@ delete_instr(isn_T *isn)
 	    blob_unref(isn->isn_arg.blob);
 	    break;
 
-	case ISN_PUSHPARTIAL:
-	    partial_unref(isn->isn_arg.partial);
-	    break;
-
 	case ISN_PUSHJOB:
 #ifdef FEAT_JOB_CHANNEL
 	    job_unref(isn->isn_arg.job);
@@ -5978,7 +6235,6 @@ delete_instr(isn_T *isn)
 	case ISN_COMPAREFUNC:
 	case ISN_COMPARELIST:
 	case ISN_COMPARENR:
-	case ISN_COMPAREPARTIAL:
 	case ISN_COMPARESPECIAL:
 	case ISN_COMPARESTRING:
 	case ISN_CONCAT:
